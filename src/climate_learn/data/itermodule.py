@@ -1,17 +1,13 @@
-# Standard library
+# itermodule.py
 import copy
 import glob
 import os
 from typing import Dict, Optional
-
-# Third party
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 from torchvision.transforms import transforms
 import pytorch_lightning as pl
-
-# Local application
 from .iterdataset import (
     NpyReader,
     DirectForecast,
@@ -21,11 +17,9 @@ from .iterdataset import (
     ShuffleIterableDataset,
 )
 
-
 class IterDataModule(pl.LightningDataModule):
     """ClimateLearn's iter data module interface. Encapsulates dataset/task-specific
     data modules."""
-
     def __init__(
         self,
         task,
@@ -132,7 +126,6 @@ class IterDataModule(pl.LightningDataModule):
             in_size = torch.Size(
                 [self.hparams.batch_size, len(self.hparams.in_vars), lat, lon]
             )
-        ##TODO: change out size
         out_vars = copy.deepcopy(self.hparams.out_vars)
         if "2m_temperature_extreme_mask" in out_vars:
             out_vars.remove("2m_temperature_extreme_mask")
@@ -168,7 +161,6 @@ class IterDataModule(pl.LightningDataModule):
         return new_clim_dict
 
     def setup(self, stage: Optional[str] = None):
-        # load datasets only if they're not loaded already
         if stage != "test":
             if not self.data_train and not self.data_val and not self.data_test:
                 self.data_train = ShuffleIterableDataset(
@@ -270,19 +262,19 @@ class IterDataModule(pl.LightningDataModule):
             collate_fn=self.collate_fn,
         )
 
-
 def collate_fn(batch):
     def handle_dict_features(t: Dict[str, torch.tensor]) -> torch.tensor:
         t = torch.stack(tuple(t.values()))
         if len(t.size()) == 4:
             return torch.transpose(t, 0, 1)
         return t
-
+    
     inp = torch.stack([handle_dict_features(batch[i][0]) for i in range(len(batch))])
     has_extreme_mask = False
     for key in batch[0][1]:
         if key == "2m_temperature_extreme_mask":
             has_extreme_mask = True
+    
     if not has_extreme_mask:
         out = torch.stack(
             [handle_dict_features(batch[i][1]) for i in range(len(batch))]
@@ -290,6 +282,7 @@ def collate_fn(batch):
         variables = list(batch[0][0].keys())
         out_variables = list(batch[0][1].keys())
         return inp, out, variables, out_variables
+    
     out = []
     mask = []
     for i in range(len(batch)):
@@ -310,14 +303,13 @@ def collate_fn(batch):
     out_variables = list(out_dict.keys())
     return inp, out, mask, variables, out_variables
 
-
 def collate_fn_continuous(batch):
     def handle_dict_features(t: Dict[str, torch.tensor]) -> torch.tensor:
         t = torch.stack(tuple(t.values()))
         if len(t.size()) == 4:
             return torch.transpose(t, 0, 1)
         return t
-
+    
     inp = torch.stack([handle_dict_features(batch[i][0]) for i in range(len(batch))])
     out = torch.stack([handle_dict_features(batch[i][1]) for i in range(len(batch))])
     lead_times = torch.stack([batch[i][2] for i in range(len(batch))])

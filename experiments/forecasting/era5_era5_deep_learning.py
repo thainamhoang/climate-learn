@@ -1,7 +1,5 @@
-# Standard library
+# era5_era5_deep_learning.py
 from argparse import ArgumentParser
-
-# Third party
 import climate_learn as cl
 from climate_learn.data.processing.era5_constants import (
     PRESSURE_LEVEL_VARS,
@@ -15,20 +13,32 @@ from pytorch_lightning.callbacks import (
     RichProgressBar,
 )
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
-
+import os
+import numpy as np
+import matplotlib.pyplot as plt
 
 parser = ArgumentParser()
-
 parser.add_argument("--summary_depth", type=int, default=1)
 parser.add_argument("--max_epochs", type=int, default=50)
 parser.add_argument("--patience", type=int, default=5)
 parser.add_argument("--gpu", type=int, default=-1)
 parser.add_argument("--checkpoint", default=None)
 
+# NEW: Attention visualization arguments
+parser.add_argument("--save_attention", action="store_true", 
+                    help="Save attention maps during validation/test")
+parser.add_argument("--attention_save_dir", type=str, default="attention_maps",
+                    help="Directory to save attention maps")
+parser.add_argument("--visualize_attention", action="store_true",
+                    help="Generate visualization plots from saved attention maps")
+parser.add_argument("--attention_layer", type=int, default=-1,
+                    help="Which transformer layer to visualize (-1 for last)")
+
 subparsers = parser.add_subparsers(
     help="Whether to perform direct, iterative, or continuous forecasting.",
     dest="forecast_type",
 )
+
 direct = subparsers.add_parser("direct")
 iterative = subparsers.add_parser("iterative")
 continuous = subparsers.add_parser("continuous")
@@ -62,6 +72,7 @@ variables = [
     "orography",
     "lattitude",
 ]
+
 in_vars = []
 for var in variables:
     if var in PRESSURE_LEVEL_VARS:
@@ -69,10 +80,12 @@ for var in variables:
             in_vars.append(var + "_" + str(level))
     else:
         in_vars.append(var)
+
 if args.forecast_type in ("direct", "continuous"):
     out_variables = ["2m_temperature", "geopotential_500", "temperature_850"]
 elif args.forecast_type == "iterative":
     out_variables = variables
+
 out_vars = []
 for var in out_variables:
     if var in PRESSURE_LEVEL_VARS:
@@ -80,6 +93,7 @@ for var in out_variables:
             out_vars.append(var + "_" + str(level))
     else:
         out_vars.append(var)
+
 if args.forecast_type in ("direct", "iterative"):
     dm = cl.data.IterDataModule(
         f"{args.forecast_type}-forecasting",
@@ -114,6 +128,7 @@ elif args.forecast_type == "continuous":
         buffer_size=2000,
         num_workers=8,
     )
+
 dm.setup()
 
 # Set up deep learning model
@@ -124,15 +139,16 @@ if args.forecast_type == "iterative":  # iterative predicts every var
     out_channels = in_channels
 else:
     out_channels = 3
+
 if args.model == "resnet":
-    model_kwargs = {  # override some of the defaults
+    model_kwargs = {
         "in_channels": in_channels,
         "out_channels": out_channels,
         "history": 3,
         "n_blocks": 28,
     }
 elif args.model == "unet":
-    model_kwargs = {  # override some of the defaults
+    model_kwargs = {
         "in_channels": in_channels,
         "out_channels": out_channels,
         "history": 3,
@@ -140,7 +156,7 @@ elif args.model == "unet":
         "is_attn": (False, False, False),
     }
 elif args.model == "vit":
-    model_kwargs = {  # override some of the defaults
+    model_kwargs = {
         "img_size": (32, 64),
         "in_channels": in_channels,
         "out_channels": out_channels,
@@ -151,7 +167,11 @@ elif args.model == "vit":
         "decoder_depth": 2,
         "learn_pos_emb": True,
         "num_heads": 4,
+        # NEW: Attention saving parameters
+        "save_attention": args.save_attention,
+        "attention_layers": [args.attention_layer] if args.save_attention else None,
     }
+
 optim_kwargs = {"lr": 5e-4, "weight_decay": 1e-5, "betas": (0.9, 0.99)}
 sched_kwargs = {
     "warmup_epochs": 5,
@@ -159,6 +179,7 @@ sched_kwargs = {
     "warmup_start_lr": 1e-8,
     "eta_min": 1e-8,
 }
+
 model = cl.load_forecasting_module(
     data_module=dm,
     model=args.model,
@@ -167,6 +188,9 @@ model = cl.load_forecasting_module(
     optim_kwargs=optim_kwargs,
     sched="linear-warmup-cosine-annealing",
     sched_kwargs=sched_kwargs,
+    # NEW: Pass attention saving params to LitModule
+    save_attention=args.save_attention,
+    attention_save_dir=args.attention_save_dir,
 )
 
 # Setup trainer
@@ -185,6 +209,7 @@ callbacks = [
         auto_insert_metric_name=False,
     ),
 ]
+
 trainer = pl.Trainer(
     logger=logger,
     callbacks=callbacks,
@@ -195,7 +220,6 @@ trainer = pl.Trainer(
     strategy="ddp",
     precision="16",
 )
-
 
 # Define testing regime for iterative forecasting
 def iterative_testing(model, trainer, args, from_checkpoint=False):
@@ -219,7 +243,6 @@ def iterative_testing(model, trainer, args, from_checkpoint=False):
             trainer.test(model, datamodule=test_dm)
         else:
             trainer.test(model, datamodule=test_dm, ckpt_path="best")
-
 
 # Define testing regime for continuous forecasting
 def continuous_testing(model, trainer, args, from_checkpoint=False):
@@ -247,6 +270,81 @@ def continuous_testing(model, trainer, args, from_checkpoint=False):
         else:
             trainer.test(model, datamodule=test_dm, ckpt_path="best")
 
+# NEW: Attention visualization function
+def visualize_attention_maps(attention_dir, img_size=(32, 64), patch_size=2):
+    """Generate visualization plots from saved attention maps"""
+    import glob
+    
+    attention_files = glob.glob(os.path.join(attention_dir, "*.npy"))
+    
+    if not attention_files:
+        print(f"⚠️  No attention files found in {attention_dir}")
+        return
+    
+    print(f"📊 Found {len(attention_files)} attention map files")
+    
+    # Create visualization directory
+    viz_dir = os.path.join(attention_dir, "visualizations")
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    for attn_file in attention_files:
+        # Load attention weights
+        attn = np.load(attn_file)  # [B, heads, N, N]
+        
+        # Extract filename info
+        filename = os.path.basename(attn_file).replace(".npy", "")
+        
+        # Average over batch and heads for visualization
+        attn_mean = attn.mean(axis=(0, 1))  # [N, N]
+        
+        # Compute patch grid dimensions
+        num_patches = attn_mean.shape[0]
+        grid_h = img_size[0] // patch_size
+        grid_w = img_size[1] // patch_size
+        
+        # Reshape to grid for spatial visualization
+        attn_grid = attn_mean.reshape(grid_h, grid_w, num_patches)
+        
+        # Plot attention from first patch to all others
+        plt.figure(figsize=(15, 5))
+        
+        # Subplot 1: Attention matrix
+        plt.subplot(1, 3, 1)
+        plt.imshow(attn_mean, cmap='viridis')
+        plt.title(f"Attention Matrix\n{filename}")
+        plt.xlabel("Key Patches")
+        plt.ylabel("Query Patches")
+        plt.colorbar(label="Attention Weight")
+        
+        # Subplot 2: First row (first patch attention to all)
+        plt.subplot(1, 3, 2)
+        first_row = attn_mean[0, :].reshape(grid_h, grid_w)
+        plt.imshow(first_row, cmap='hot')
+        plt.title("First Patch → All Patches")
+        plt.xlabel("Width")
+        plt.ylabel("Height")
+        plt.colorbar(label="Attention Weight")
+        
+        # Subplot 3: Attention entropy per patch
+        plt.subplot(1, 3, 3)
+        entropy = -np.sum(attn_mean * np.log(attn_mean + 1e-10), axis=1)
+        entropy_grid = entropy.reshape(grid_h, grid_w)
+        plt.imshow(entropy_grid, cmap='magma')
+        plt.title("Attention Entropy\n(Lower = More Focused)")
+        plt.xlabel("Width")
+        plt.ylabel("Height")
+        plt.colorbar(label="Entropy")
+        
+        plt.tight_layout()
+        
+        # Save visualization
+        viz_path = os.path.join(viz_dir, f"{filename}.png")
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✅ Saved visualization: {viz_path}")
+    
+    print(f"\n🎨 All visualizations saved to: {viz_dir}")
 
 # Train and evaluate model from scratch
 if args.checkpoint is None:
@@ -257,7 +355,6 @@ if args.checkpoint is None:
         iterative_testing(model, trainer, args)
     elif args.forecast_type == "continuous":
         continuous_testing(model, trainer, args)
-# Evaluate saved model checkpoint
 else:
     model = cl.LitModule.load_from_checkpoint(
         args.checkpoint,
@@ -275,3 +372,12 @@ else:
         iterative_testing(model, trainer, args, from_checkpoint=True)
     elif args.forecast_type == "continuous":
         continuous_testing(model, trainer, args, from_checkpoint=True)
+
+# NEW: Generate visualizations after training/testing
+if args.visualize_attention:
+    print("\n🎨 Generating attention visualizations...")
+    visualize_attention_maps(
+        args.attention_save_dir,
+        img_size=model_kwargs.get("img_size", (32, 64)),
+        patch_size=model_kwargs.get("patch_size", 2),
+    )

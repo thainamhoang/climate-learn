@@ -1,13 +1,12 @@
-# Local application
+# vit.py
 from .components.cnn_blocks import PeriodicConv2D
 from .components.pos_embed import get_2d_sincos_pos_embed
 from .utils import register
-
-# Third party
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import Block, PatchEmbed, trunc_normal_
-
+from typing import List, Optional, Dict
+import numpy as np
 
 @register("vit")
 class VisionTransformer(nn.Module):
@@ -26,13 +25,17 @@ class VisionTransformer(nn.Module):
         decoder_depth=8,
         num_heads=16,
         mlp_ratio=4.0,
+        save_attention=False,  # NEW: Enable attention saving
+        attention_layers=None,  # NEW: Which layers to save (-1 for all)
     ):
         super().__init__()
         self.img_size = img_size
         self.in_channels = in_channels * history
         self.out_channels = out_channels
         self.patch_size = patch_size
-
+        self.save_attention = save_attention
+        self.attention_layers = attention_layers if attention_layers is not None else [-1]
+        
         self.patch_embed = PatchEmbed(img_size, patch_size, self.in_channels, embed_dim)
         self.num_patches = self.patch_embed.num_patches
 
@@ -41,6 +44,7 @@ class VisionTransformer(nn.Module):
         )
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path, depth)]
+        
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -64,7 +68,33 @@ class VisionTransformer(nn.Module):
             self.head.append(nn.GELU())
         self.head.append(nn.Linear(embed_dim, out_channels * patch_size**2))
         self.head = nn.Sequential(*self.head)
+        
+        # NEW: Attention storage
+        self.attention_weights: Dict[int, torch.Tensor] = {}
+        self._hooks = []
+        
+        # NEW: Register attention hooks if enabled
+        if self.save_attention:
+            self._register_attention_hooks()
+        
         self.initialize_weights()
+
+    def _register_attention_hooks(self):
+        """Register forward hooks to capture attention weights"""
+        def _make_hook(layer_idx):
+            def hook(module, input, output):
+                # TIMM Block returns (x, attn) if attn is stored
+                if isinstance(output, tuple) and len(output) == 2:
+                    attn_weights = output[1]  # [B, heads, N, N]
+                    self.attention_weights[layer_idx] = attn_weights.detach().cpu()
+            return hook
+        
+        for idx, block in enumerate(self.blocks):
+            if idx in self.attention_layers or -1 in self.attention_layers:
+                # Register hook on the attention submodule
+                if hasattr(block, 'attn'):
+                    hook = block.attn.register_forward_hook(_make_hook(idx))
+                    self._hooks.append(hook)
 
     def initialize_weights(self):
         pos_embed = get_2d_sincos_pos_embed(
@@ -123,3 +153,46 @@ class VisionTransformer(nn.Module):
         preds = self.unpatchify(x)
         # preds.shape = [B,out_channels,H,W]
         return preds
+
+    def get_attention_weights(self, layer_idx: int = -1) -> Optional[torch.Tensor]:
+        """
+        Retrieve attention weights from specified layer
+        Returns: [B, num_heads, num_patches, num_patches] or None
+        """
+        if layer_idx in self.attention_weights:
+            return self.attention_weights[layer_idx]
+        return None
+
+    def get_all_attention_weights(self) -> Dict[int, torch.Tensor]:
+        """Retrieve all stored attention weights"""
+        return self.attention_weights.copy()
+
+    def clear_attention_weights(self):
+        """Clear stored attention weights (call before each forward pass if needed)"""
+        self.attention_weights.clear()
+
+    def get_cls_attention(self, layer_idx: int = -1) -> Optional[torch.Tensor]:
+        """
+        Get CLS token attention to all patches (if CLS exists)
+        For this implementation without CLS, returns first patch attention
+        Returns: [B, num_heads, num_patches]
+        """
+        attn = self.get_attention_weights(layer_idx)
+        if attn is not None:
+            # Return attention from first position to all others
+            return attn[:, :, 0, :]  # [B, heads, N]
+        return None
+
+    def compute_attention_entropy(self, layer_idx: int = -1) -> Optional[torch.Tensor]:
+        """
+        Compute entropy of attention distribution (lower = more focused)
+        Returns: [B, num_heads]
+        """
+        attn = self.get_attention_weights(layer_idx)
+        if attn is not None:
+            # Average over query positions
+            attn_mean = attn.mean(dim=2)  # [B, heads, N]
+            attn_mean = attn_mean + 1e-10  # Avoid log(0)
+            entropy = -torch.sum(attn_mean * torch.log(attn_mean), dim=-1)  # [B, heads]
+            return entropy
+        return None

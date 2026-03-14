@@ -1,15 +1,12 @@
-# Standard library
+# module.py
 from typing import Callable, List, Optional, Tuple, Union
-
-# Local application
 from ..data.processing.era5_constants import CONSTANTS
-
-# Third party
 import torch
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 import pytorch_lightning as pl
-
+import numpy as np
+import os
 
 class LitModule(pl.LightningModule):
     def __init__(
@@ -23,6 +20,8 @@ class LitModule(pl.LightningModule):
         train_target_transform: Optional[Callable] = None,
         val_target_transforms: Optional[List[Union[Callable, None]]] = None,
         test_target_transforms: Optional[List[Union[Callable, None]]] = None,
+        save_attention: bool = False,  # NEW
+        attention_save_dir: str = "attention_maps",  # NEW
     ):
         super().__init__()
         self.net = net
@@ -32,23 +31,31 @@ class LitModule(pl.LightningModule):
         self.val_loss = val_loss
         self.test_loss = test_loss
         self.train_target_transform = train_target_transform
+        self.save_attention = save_attention
+        self.attention_save_dir = attention_save_dir
+        
         if val_target_transforms is not None:
             if len(val_loss) != len(val_target_transforms):
                 raise RuntimeError(
-                    "If 'val_target_transforms' is not None, its length must"
-                    " match that of 'val_loss'. 'None' can be passed for"
-                    " losses which do not require transformation."
+                    "If 'val_target_transforms' is not None, its length must "
+                    "match that of 'val_loss'. 'None' can be passed for "
+                    "losses which do not require transformation. "
                 )
-        self.val_target_transforms = val_target_transforms
+            self.val_target_transforms = val_target_transforms
         if test_target_transforms is not None:
             if len(test_loss) != len(test_target_transforms):
                 raise RuntimeError(
-                    "If 'test_target_transforms' is not None, its length must"
-                    " match that of 'test_loss'. 'None' can be passed for "
-                    " losses which do not rqeuire transformation."
+                    "If 'test_target_transforms' is not None, its length must "
+                    "match that of 'test_loss'. 'None' can be passed for  "
+                    "losses which do not rqeuire transformation. "
                 )
-        self.test_target_transforms = test_target_transforms
+            self.test_target_transforms = test_target_transforms
+        
         self.mode = "direct"
+        
+        # NEW: Create attention save directory
+        if self.save_attention:
+            os.makedirs(self.attention_save_dir, exist_ok=True)
 
     def set_mode(self, mode):
         self.mode = mode
@@ -102,7 +109,11 @@ class LitModule(pl.LightningModule):
         batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]],
         batch_idx: int,
     ) -> torch.Tensor:
-        self.evaluate(batch, "val")
+        # NEW: Save attention maps during validation (first batch only)
+        if self.save_attention and batch_idx == 0:
+            self._save_attention_maps(batch, "val", batch_idx)
+        
+        return self.evaluate(batch, "val")
 
     def test_step(
         self,
@@ -110,9 +121,58 @@ class LitModule(pl.LightningModule):
         batch_idx: int,
     ) -> torch.Tensor:
         if self.mode == "direct":
+            # NEW: Save attention maps during test
+            if self.save_attention and batch_idx == 0:
+                self._save_attention_maps(batch, "test", batch_idx)
             self.evaluate(batch, "test")
         if self.mode == "iter":
             self.evaluate_iter(batch, self.n_iters, "test")
+
+    def _save_attention_maps(
+        self, 
+        batch: Tuple[torch.Tensor, ...], 
+        stage: str, 
+        batch_idx: int
+    ):
+        """Save attention weights to disk for visualization"""
+        x, y, in_variables, out_variables = batch
+        
+        # Clear previous attention weights
+        if hasattr(self.net, 'clear_attention_weights'):
+            self.net.clear_attention_weights()
+        
+        # Forward pass to capture attention
+        with torch.no_grad():
+            yhat = self(x.to(self.device))
+        
+        # Get attention weights
+        if hasattr(self.net, 'get_all_attention_weights'):
+            attention_weights = self.net.get_all_attention_weights()
+            
+            for layer_idx, attn in attention_weights.items():
+                # Save as numpy for easier visualization later
+                attn_np = attn.cpu().numpy()  # [B, heads, N, N]
+                
+                # Create save path
+                save_path = os.path.join(
+                    self.attention_save_dir,
+                    f"attention_{stage}_batch{batch_idx}_layer{layer_idx}.npy"
+                )
+                np.save(save_path, attn_np)
+                
+                # Log attention entropy as metric
+                if hasattr(self.net, 'compute_attention_entropy'):
+                    entropy = self.net.compute_attention_entropy(layer_idx)
+                    if entropy is not None:
+                        avg_entropy = entropy.mean().item()
+                        self.log(
+                            f"{stage}/attention_entropy_layer{layer_idx}",
+                            avg_entropy,
+                            on_epoch=True,
+                            sync_dist=True,
+                        )
+                
+                print(f"💾 Saved attention map: {save_path} (shape: {attn_np.shape})")
 
     def evaluate(
         self, batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]], stage: str
@@ -133,6 +193,9 @@ class LitModule(pl.LightningModule):
             if transforms is not None and transforms[i] is not None:
                 yhat_ = transforms[i](yhat)
                 y_ = transforms[i](y)
+            else:
+                yhat_ = yhat
+                y_ = y
             losses = lf(yhat_, y_)
             loss_name = getattr(lf, "name", f"loss_{i}")
             if losses.dim() == 0:  # aggregate loss
@@ -200,6 +263,15 @@ class LitModule(pl.LightningModule):
             batch_size=len(batch[0]),
         )
         return loss_dict
+
+    def predict_step(
+        self,
+        batch: Tuple[torch.Tensor, ...],
+        batch_idx: int,
+    ) -> torch.Tensor:
+        x, y, *other_items = batch
+        predictions = self(x)
+        return predictions
 
     def configure_optimizers(self):
         if self.lr_scheduler is None:
