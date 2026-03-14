@@ -1,4 +1,4 @@
-# module.py
+# module.py - MODIFIED FOR ATTENTION SAVING
 from typing import Callable, List, Optional, Tuple, Union
 from ..data.processing.era5_constants import CONSTANTS
 import torch
@@ -20,8 +20,9 @@ class LitModule(pl.LightningModule):
         train_target_transform: Optional[Callable] = None,
         val_target_transforms: Optional[List[Union[Callable, None]]] = None,
         test_target_transforms: Optional[List[Union[Callable, None]]] = None,
-        save_attention: bool = False,  # NEW
-        attention_save_dir: str = "attention_maps",  # NEW
+        # NEW: Attention parameters
+        save_attention: bool = False,
+        attention_save_dir: str = "attention_maps",
     ):
         super().__init__()
         self.net = net
@@ -31,6 +32,7 @@ class LitModule(pl.LightningModule):
         self.val_loss = val_loss
         self.test_loss = test_loss
         self.train_target_transform = train_target_transform
+        # NEW: Attention saving config
         self.save_attention = save_attention
         self.attention_save_dir = attention_save_dir
         
@@ -65,7 +67,6 @@ class LitModule(pl.LightningModule):
 
     def replace_constant(self, y, yhat, out_variables):
         for i in range(yhat.shape[1]):
-            # if constant replace with ground-truth value
             if out_variables[i] in CONSTANTS:
                 yhat[:, i] = y[:, i]
         return yhat
@@ -73,11 +74,7 @@ class LitModule(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-    def training_step(
-        self,
-        batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]],
-        batch_idx: int,
-    ) -> torch.Tensor:
+    def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         x, y, in_variables, out_variables = batch
         yhat = self(x).to(device=y.device)
         yhat = self.replace_constant(y, yhat, out_variables)
@@ -87,53 +84,34 @@ class LitModule(pl.LightningModule):
         losses = self.train_loss(yhat, y)
         loss_name = getattr(self.train_loss, "name", "loss")
         loss_dict = {}
-        if losses.dim() == 0:  # aggregate loss only
+        if losses.dim() == 0:
             loss = losses
             loss_dict[f"train/{loss_name}:aggregate"] = loss
-        else:  # per channel + aggregate
+        else:
             for var_name, loss in zip(out_variables, losses):
                 loss_dict[f"train/{loss_name}:{var_name}"] = loss
             loss = losses[-1]
             loss_dict[f"train/{loss_name}:aggregate"] = loss
-        self.log_dict(
-            loss_dict,
-            prog_bar=True,
-            on_step=True,
-            on_epoch=False,
-            batch_size=x.shape[0],
-        )
+        self.log_dict(loss_dict, prog_bar=True, on_step=True, on_epoch=False, batch_size=x.shape[0])
         return loss
 
-    def validation_step(
-        self,
-        batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]],
-        batch_idx: int,
-    ) -> torch.Tensor:
-        # NEW: Save attention maps during validation (first batch only)
+    def validation_step(self, batch, batch_idx: int) -> torch.Tensor:
+        # NEW: Save attention on first validation batch
         if self.save_attention and batch_idx == 0:
             self._save_attention_maps(batch, "val", batch_idx)
-        
         return self.evaluate(batch, "val")
 
-    def test_step(
-        self,
-        batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]],
-        batch_idx: int,
-    ) -> torch.Tensor:
+    def test_step(self, batch, batch_idx: int) -> torch.Tensor:
+        # NEW: Save attention on first test batch
+        if self.save_attention and batch_idx == 0:
+            self._save_attention_maps(batch, "test", batch_idx)
         if self.mode == "direct":
-            # NEW: Save attention maps during test
-            if self.save_attention and batch_idx == 0:
-                self._save_attention_maps(batch, "test", batch_idx)
-            self.evaluate(batch, "test")
+            return self.evaluate(batch, "test")
         if self.mode == "iter":
-            self.evaluate_iter(batch, self.n_iters, "test")
+            return self.evaluate_iter(batch, self.n_iters, "test")
 
-    def _save_attention_maps(
-        self, 
-        batch: Tuple[torch.Tensor, ...], 
-        stage: str, 
-        batch_idx: int
-    ):
+    # NEW: Core attention saving method
+    def _save_attention_maps(self, batch, stage: str, batch_idx: int):
         """Save attention weights to disk for visualization"""
         x, y, in_variables, out_variables = batch
         
@@ -143,40 +121,30 @@ class LitModule(pl.LightningModule):
         
         # Forward pass to capture attention
         with torch.no_grad():
-            yhat = self(x.to(self.device))
+            _ = self(x.to(self.device))
         
-        # Get attention weights
+        # Get and save attention weights
         if hasattr(self.net, 'get_all_attention_weights'):
             attention_weights = self.net.get_all_attention_weights()
             
             for layer_idx, attn in attention_weights.items():
-                # Save as numpy for easier visualization later
-                attn_np = attn.cpu().numpy()  # [B, heads, N, N]
-                
-                # Create save path
+                attn_np = attn.cpu().numpy()
                 save_path = os.path.join(
                     self.attention_save_dir,
                     f"attention_{stage}_batch{batch_idx}_layer{layer_idx}.npy"
                 )
                 np.save(save_path, attn_np)
                 
-                # Log attention entropy as metric
+                # Log entropy metric
                 if hasattr(self.net, 'compute_attention_entropy'):
                     entropy = self.net.compute_attention_entropy(layer_idx)
                     if entropy is not None:
-                        avg_entropy = entropy.mean().item()
-                        self.log(
-                            f"{stage}/attention_entropy_layer{layer_idx}",
-                            avg_entropy,
-                            on_epoch=True,
-                            sync_dist=True,
-                        )
+                        self.log(f"{stage}/attention_entropy_layer{layer_idx}", 
+                              entropy.mean().item(), on_epoch=True, sync_dist=True)
                 
-                print(f"💾 Saved attention map: {save_path} (shape: {attn_np.shape})")
+                print(f"💾 Saved: {save_path} (shape: {attn_np.shape})")
 
-    def evaluate(
-        self, batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]], stage: str
-    ):
+    def evaluate(self, batch, stage: str):
         x, y, in_variables, out_variables = batch
         yhat = self(x).to(device=y.device)
         yhat = self.replace_constant(y, yhat, out_variables)
@@ -198,30 +166,17 @@ class LitModule(pl.LightningModule):
                 y_ = y
             losses = lf(yhat_, y_)
             loss_name = getattr(lf, "name", f"loss_{i}")
-            if losses.dim() == 0:  # aggregate loss
+            if losses.dim() == 0:
                 loss_dict[f"{stage}/{loss_name}:agggregate"] = losses
-            else:  # per channel + aggregate
+            else:
                 for var_name, loss in zip(out_variables, losses):
-                    name = f"{stage}/{loss_name}:{var_name}"
-                    loss_dict[name] = loss
+                    loss_dict[f"{stage}/{loss_name}:{var_name}"] = loss
                 loss_dict[f"{stage}/{loss_name}:aggregate"] = losses[-1]
-        self.log_dict(
-            loss_dict,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=len(batch[0]),
-        )
+        self.log_dict(loss_dict, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(batch[0]))
         return loss_dict
 
-    def evaluate_iter(
-        self,
-        batch: Tuple[torch.Tensor, torch.Tensor, List[str], List[str]],
-        n_iters: int,
-        stage: str,
-    ):
+    def evaluate_iter(self, batch, n_iters: int, stage: str):
         x, y, in_variables, out_variables = batch
-
         x_iter = x
         for _ in range(n_iters):
             yhat_iter = self(x_iter).to(device=x_iter.device)
@@ -229,7 +184,6 @@ class LitModule(pl.LightningModule):
             x_iter = x_iter[:, 1:]
             x_iter = torch.cat((x_iter, yhat_iter.unsqueeze(1)), dim=1)
         yhat = yhat_iter
-
         if stage == "val":
             loss_fns = self.val_loss
             transforms = self.val_target_transforms
@@ -248,30 +202,18 @@ class LitModule(pl.LightningModule):
                 y_t = y
             losses = lf(yhat_t, y_t)
             loss_name = getattr(lf, "name", f"loss_{i}")
-            if losses.dim() == 0:  # aggregate loss
+            if losses.dim() == 0:
                 loss_dict[f"{stage}/{loss_name}:agggregate"] = losses
-            else:  # per channel + aggregate
+            else:
                 for var_name, loss in zip(out_variables, losses):
-                    name = f"{stage}/{loss_name}:{var_name}"
-                    loss_dict[name] = loss
+                    loss_dict[f"{stage}/{loss_name}:{var_name}"] = loss
                 loss_dict[f"{stage}/{loss_name}:aggregate"] = losses[-1]
-        self.log_dict(
-            loss_dict,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=len(batch[0]),
-        )
+        self.log_dict(loss_dict, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(batch[0]))
         return loss_dict
 
-    def predict_step(
-        self,
-        batch: Tuple[torch.Tensor, ...],
-        batch_idx: int,
-    ) -> torch.Tensor:
+    def predict_step(self, batch, batch_idx: int) -> torch.Tensor:
         x, y, *other_items = batch
-        predictions = self(x)
-        return predictions
+        return self(x)
 
     def configure_optimizers(self):
         if self.lr_scheduler is None:
