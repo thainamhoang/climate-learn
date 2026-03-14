@@ -1,4 +1,3 @@
-# module.py - MODIFIED FOR ATTENTION SAVING
 from typing import Callable, List, Optional, Tuple, Union
 from ..data.processing.era5_constants import CONSTANTS
 import torch

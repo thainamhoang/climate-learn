@@ -1,4 +1,3 @@
-# vit.py - MODIFIED FOR ATTENTION SAVING
 from .components.cnn_blocks import PeriodicConv2D
 from .components.pos_embed import get_2d_sincos_pos_embed
 from .utils import register

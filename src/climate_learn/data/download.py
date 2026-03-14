@@ -60,17 +60,23 @@ def download_weatherbench(dst, dataset, variable, resolution=5.625):
     os.makedirs(dst, exist_ok=True)
     if dataset not in ["era5", "cmip6"]:
         raise RuntimeError("Dataset not supported")
-    url = "https://dataserv.ub.tum.de/s/m1524895/download?path=%2F"
+    url = "https://dataserv.ub.tum.de/public.php/dav/files/m1524895"
     res = f"{resolution}deg"
     if dataset == "era5":
         ext = ".nc" if variable == "constants" else ".zip"
         remote_fn = f"{variable}_{res}{ext}"
-        url = f"{url}{res}%2F{variable}&files={remote_fn}"
+        url = f"{url}/{res}/{variable}/{remote_fn}"
     elif dataset == "cmip6":
         ext = ".zip"
         remote_fn = f"{variable}_{res}{ext}"
-        url = f"{url}CMIP%2FMPI-ESM%2F{res}%2F{variable}&files={remote_fn}"
-    resp = requests.get(url, verify=False, stream=True)
+        url = f"{url}CMIP/MPI-ESM/{res}/{variable}/{remote_fn}"
+    resp = requests.get(url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0",
+                        },
+                        verify=False,
+                        stream=True,
+                        allow_redirects=True)
     if variable == "constants":
         local_fn = os.path.join(dst, "constants.nc")
     else:
