@@ -70,6 +70,7 @@ def download_weatherbench(dst, dataset, variable, resolution=5.625):
         ext = ".zip"
         remote_fn = f"{variable}_{res}{ext}"
         url = f"{url}CMIP/MPI-ESM/{res}/{variable}/{remote_fn}"
+    print(url)
     resp = requests.get(url,
                         headers={
                             "User-Agent": "Mozilla/5.0",
